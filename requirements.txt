@@ -1,0 +1,5 @@
+ultralytics==8.0.150
+opencv-python
+pillow
+piexif
+requests
