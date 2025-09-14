@@ -1,5 +1,0 @@
-joblib
-opencv-python
-pytesseract
-scikit-learn
-Pillow

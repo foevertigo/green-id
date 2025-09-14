@@ -1,38 +1,82 @@
-from planting.video_processing.verify_video import verify_video_planting_from_url
-from planting.geo_verification.check_gps import get_gps_coords
-from planting.utils.download_media import download_from_url
-import os
+# planting/verification_pipeline.py
+from fastapi import FastAPI, UploadFile, File, Form
+import shutil, os, json
+from pathlib import Path
 
-def verify_geo_match(img_url_1, img_url_2):
-    print("Comparing GPS between two images")
-    img1_path = "planting/uploads/weekly_images/img1.jpg"
-    img2_path = "planting/uploads/weekly_images/img2.jpg"
-    download_from_url(img_url_1, img1_path)
-    download_from_url(img_url_2, img2_path)
+from utils.download_media import save_uploaded_video
+from utils.check_gps import validate_gps
+from utils.cleanup import ensure_empty_dir, cleanup_paths
+from video_processing.extract_frames import extract_frames
+from video_processing.verify_video import verify_planting_from_frames
 
-    gps1 = get_gps_coords(img1_path)
-    gps2 = get_gps_coords(img2_path)
+app = FastAPI()
+BASE = Path(__file__).parent.resolve()
+UPLOADS_VIDEOS = BASE / ".." / "uploads" / "videos"
+UPLOADS_FRAMES = BASE / ".." / "uploads" / "frames"
+# normalize
+UPLOADS_VIDEOS = UPLOADS_VIDEOS.resolve()
+UPLOADS_FRAMES = UPLOADS_FRAMES.resolve()
+os.makedirs(UPLOADS_VIDEOS, exist_ok=True)
+os.makedirs(UPLOADS_FRAMES, exist_ok=True)
 
-    if not gps1 or not gps2:
-        print("One or both images lack GPS metadata.")
-        return False
+@app.get("/")
+def root():
+    return {"msg": "Green-ID planting verification service running"}
 
-    result = abs(gps1[0] - gps2[0]) < 0.001 and abs(gps1[1] - gps2[1]) < 0.001
-    print("GPS Match" if result else "GPS Mismatch")
-    return result
-
-# Example usage
-if __name__ == "__main__":
-    video_url = "https://your-cdn.com/videos/week0.mp4"
-    week0_img_url = "https://your-cdn.com/images/week0.jpg"
-    week1_img_url = "https://your-cdn.com/images/week1.jpg"
-
-    print("Starting Planting Verification Pipeline")
-    planting_valid = verify_video_planting_from_url(video_url)
-    geo_valid = verify_geo_match(week0_img_url, week1_img_url)
-
-    if planting_valid and geo_valid:
-        print("Final Result: Verified Planting Activity")
+@app.post("/verify")
+async def verify_endpoint(file: UploadFile = File(None), lat: float = Form(None), lon: float = Form(None), use_demo: bool = Form(False)):
+    """
+    POST /verify
+    - file : video file (optional if use_demo True)
+    - lat, lon : optional GPS provided by frontend (preferred)
+    - use_demo: if True, uses uploads/videos/demo_video.mp4 instead of uploaded file
+    """
+    # Decide source video
+    if use_demo:
+        video_path = (BASE / ".." / "uploads" / "videos" / "demo_video.mp4").resolve()
+        if not video_path.exists():
+            return {"status":"fail","reason":"demo_video_missing"}
     else:
-        print("Final Result: Verification Failed")
+        if file is None:
+            return {"status":"fail","reason":"no_file_provided"}
+        saved = save_uploaded_video(file.file if hasattr(file, "file") else file.filename, dest_folder=str(UPLOADS_VIDEOS))
+        # save_uploaded_video handles paths or file-like? we have UploadFile - save explicitly
+        # For UploadFile, write directly:
+        if hasattr(file, "filename"):
+            video_path = UPLOADS_VIDEOS / file.filename
+            with open(video_path, "wb") as f:
+                shutil.copyfileobj(file.file, f)
+        else:
+            return {"status":"fail","reason":"invalid_file"}
 
+    # Validate GPS (prefer lat/lon passed)
+    gps_json = None
+    if lat is not None and lon is not None:
+        gps_json = {"lat": lat, "lon": lon}
+    ok, gps_info = validate_gps(video_path=str(video_path), gps_json=gps_json, allowed_bbox=( -90, 90, -180, 180))
+    if not ok:
+        # still continue optional: return fail now
+        return {"status":"fail", "reason":"gps_failed", "info": gps_info}
+
+    # Extract frames
+    ensure_empty_dir(str(UPLOADS_FRAMES))
+    frames = extract_frames(str(video_path), out_dir=str(UPLOADS_FRAMES), sample_fps=1, max_frames=60)
+    if not frames:
+        cleanup_paths([str(UPLOADS_FRAMES)])
+        return {"status":"fail","reason":"no_frames_extracted"}
+
+    # Verify planting
+    passed, evidence = verify_planting_from_frames(str(UPLOADS_FRAMES), min_plant_frames=1, motion_threshold=0.6)
+
+    # Cleanup frames (keep video)
+    cleanup_paths([str(UPLOADS_FRAMES)])
+
+    response = {
+        "status": "success" if passed else "fail",
+        "passed": bool(passed),
+        "evidence": evidence,
+        "gps": gps_info
+    }
+    if passed:
+        response["points_awarded"] = 10
+    return response
